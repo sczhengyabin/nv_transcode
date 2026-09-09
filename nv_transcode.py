@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 r"""
-Strict NVIDIA batch transcoder using FFmpeg from PATH.
+Strict NVIDIA batch transcoder with self-bootstrapping FFmpeg.
 
 Pipeline:
     NVDEC/CUDA decode -> scale_cuda -> NVENC encode
@@ -21,15 +21,21 @@ from __future__ import annotations
 import argparse
 import atexit
 import errno
+import hashlib
 import os
+import platform
 import re
 import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,6 +50,12 @@ ENCODERS = {
     "hevc": "hevc_nvenc",
     "av1": "av1_nvenc",
 }
+
+BTBN_RELEASE_BASE = (
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest"
+)
+BTBN_CHECKSUMS = "checksums.sha256"
+DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 
 # NVIDIA CUVID decoders that expose the decoder-side GPU crop option.
 CUVID_DECODERS = {
@@ -61,6 +73,7 @@ CUVID_DECODERS = {
 
 _ACTIVE_PROCESSES: set[subprocess.Popen] = set()
 _PROCESS_LOCK = threading.Lock()
+_OUTPUT_DIR_LOCK = threading.Lock()
 _STOP_EVENT = threading.Event()
 
 # Graceful shutdown signal captured by the main thread.
@@ -169,7 +182,7 @@ def log_event(
 def print_banner() -> None:
     width = 55
     safe_print("-" * width)
-    safe_print("|" + "NV Transcoder v26 - NVIDIA GPU".center(width - 2) + "|")
+    safe_print("|" + "NV Transcoder v29 - NVIDIA GPU".center(width - 2) + "|")
     safe_print("-" * width)
 
 
@@ -462,18 +475,314 @@ def maybe_run_internal_mode() -> int | None:
     )
 
 
+def script_directory() -> Path:
+    """Directory containing this script; auto-downloaded FFmpeg lives here."""
+    return Path(__file__).resolve().parent
+
+
+def ffmpeg_executable_name() -> str:
+    return "ffmpeg.exe" if platform.system() == "Windows" else "ffmpeg"
+
+
+def local_ffmpeg_path() -> Path:
+    return script_directory() / ffmpeg_executable_name()
+
+
+def detect_btbn_asset() -> str:
+    """Return the BtbN latest static GPL archive for this OS/architecture."""
+    machine = platform.machine().lower()
+    system = platform.system()
+
+    if machine in {"x86_64", "amd64"}:
+        arch = "64"
+    elif machine in {"aarch64", "arm64"}:
+        arch = "arm64"
+    else:
+        raise RuntimeError(
+            "当前 CPU 架构不受 BtbN 自动下载支持: "
+            f"{platform.machine() or 'unknown'}。"
+            "请使用 --ffmpeg 手动指定可执行文件。"
+        )
+
+    if system == "Linux":
+        return f"ffmpeg-master-latest-linux{arch}-gpl.tar.xz"
+
+    if system == "Windows":
+        return f"ffmpeg-master-latest-win{arch}-gpl.zip"
+
+    raise RuntimeError(
+        f"当前系统不支持 FFmpeg 自动下载: {system or sys.platform}。"
+        "自动下载仅支持 Windows 64-bit/ARM64 和 Linux x86_64/ARM64；"
+        "请使用 --ffmpeg 手动指定。"
+    )
+
+
+def _download_request(url: str) -> urllib.request.Request:
+    return urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "nv-transcode/27",
+            "Accept": "application/octet-stream,*/*",
+        },
+    )
+
+
+def download_text(url: str, timeout: float = 30.0) -> str:
+    try:
+        with urllib.request.urlopen(
+            _download_request(url),
+            timeout=timeout,
+        ) as response:
+            return response.read().decode("utf-8")
+    except (urllib.error.URLError, OSError) as exc:
+        raise RuntimeError(f"下载失败: {url}\n{exc}") from exc
+
+
+def expected_sha256(checksums: str, filename: str) -> str:
+    pattern = re.compile(
+        rf"^([0-9a-fA-F]{{64}})\s+\*?{re.escape(filename)}\s*$",
+        re.MULTILINE,
+    )
+    match = pattern.search(checksums)
+    if match is None:
+        raise RuntimeError(
+            f"BtbN checksums.sha256 中找不到 {filename}，"
+            "为安全起见拒绝继续。"
+        )
+    return match.group(1).lower()
+
+
+def download_archive(
+    url: str,
+    destination: Path,
+    *,
+    expected_hash: str,
+    timeout: float = 60.0,
+) -> None:
+    """Stream an archive to disk, show coarse progress, and verify SHA-256."""
+    digest = hashlib.sha256()
+
+    try:
+        with urllib.request.urlopen(
+            _download_request(url),
+            timeout=timeout,
+        ) as response, destination.open("wb") as output:
+            raw_length = response.headers.get("Content-Length")
+            try:
+                total = int(raw_length) if raw_length else 0
+            except ValueError:
+                total = 0
+
+            downloaded = 0
+            next_report = 10
+
+            while True:
+                chunk = response.read(DOWNLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+
+                output.write(chunk)
+                digest.update(chunk)
+                downloaded += len(chunk)
+
+                if total > 0:
+                    percent = min(100, int(downloaded * 100 / total))
+                    if percent >= next_report:
+                        log_event(
+                            "INFO",
+                            "Download",
+                            f"{percent:>3}% | "
+                            f"{format_bytes(downloaded)} / "
+                            f"{format_bytes(total)}",
+                        )
+                        next_report = (percent // 10 + 1) * 10
+
+    except (urllib.error.URLError, OSError) as exc:
+        raise RuntimeError(f"FFmpeg 下载失败: {url}\n{exc}") from exc
+
+    actual_hash = digest.hexdigest().lower()
+    if actual_hash != expected_hash.lower():
+        raise RuntimeError(
+            "FFmpeg 下载文件 SHA-256 校验失败。\n"
+            f"expected: {expected_hash}\n"
+            f"actual:   {actual_hash}"
+        )
+
+
+def _archive_ffmpeg_member(
+    names,
+    executable_name: str,
+) -> str:
+    suffix = f"/bin/{executable_name}".lower()
+
+    for name in names:
+        normalized = str(name).replace("\\", "/")
+        low = normalized.lower()
+        if low == f"bin/{executable_name}".lower() or low.endswith(suffix):
+            return str(name)
+
+    raise RuntimeError(
+        f"下载包中找不到 bin/{executable_name}"
+    )
+
+
+def extract_ffmpeg_binary(
+    archive: Path,
+    destination: Path,
+) -> None:
+    """Extract only ffmpeg(.exe), never the whole third-party archive."""
+    executable_name = ffmpeg_executable_name()
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+
+    try:
+        if zipfile.is_zipfile(archive):
+            with zipfile.ZipFile(archive, "r") as zf:
+                member = _archive_ffmpeg_member(
+                    zf.namelist(),
+                    executable_name,
+                )
+                with zf.open(member, "r") as source, temporary.open("wb") as out:
+                    shutil.copyfileobj(source, out, length=DOWNLOAD_CHUNK_SIZE)
+
+        else:
+            try:
+                tf = tarfile.open(archive, "r:xz")
+            except (tarfile.TarError, OSError) as exc:
+                raise RuntimeError(
+                    f"无法识别 FFmpeg 下载包格式: {archive.name}"
+                ) from exc
+
+            with tf:
+                regular = [
+                    member
+                    for member in tf.getmembers()
+                    if member.isfile()
+                ]
+                member_name = _archive_ffmpeg_member(
+                    [member.name for member in regular],
+                    executable_name,
+                )
+                member = next(
+                    item for item in regular
+                    if item.name == member_name
+                )
+                source = tf.extractfile(member)
+                if source is None:
+                    raise RuntimeError(
+                        f"无法读取压缩包成员: {member.name}"
+                    )
+                with source, temporary.open("wb") as out:
+                    shutil.copyfileobj(
+                        source,
+                        out,
+                        length=DOWNLOAD_CHUNK_SIZE,
+                    )
+
+        if temporary.stat().st_size <= 0:
+            raise RuntimeError("解压得到的 FFmpeg 文件为空")
+
+        if platform.system() != "Windows":
+            temporary.chmod(0o755)
+
+        os.replace(temporary, destination)
+
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def auto_download_ffmpeg() -> str:
+    """
+    Download the latest BtbN static GPL FFmpeg into the script directory.
+
+    The archive is temporary. Only ffmpeg(.exe) is retained.
+    """
+    target = local_ffmpeg_path()
+    if target.is_file():
+        return str(target)
+
+    asset = detect_btbn_asset()
+    base = BTBN_RELEASE_BASE.rstrip("/")
+    checksum_url = f"{base}/{BTBN_CHECKSUMS}"
+    archive_url = f"{base}/{asset}"
+    archive = script_directory() / (
+        f".{asset}.{os.getpid()}.{uuid.uuid4().hex}.part"
+    )
+
+    log_event(
+        "INFO",
+        "FFmpeg",
+        f"not found | auto-download BtbN {asset}",
+    )
+    log_event(
+        "INFO",
+        "Download",
+        f"destination: {target}",
+    )
+
+    try:
+        checksums = download_text(checksum_url)
+        expected_hash = expected_sha256(checksums, asset)
+
+        download_archive(
+            archive_url,
+            archive,
+            expected_hash=expected_hash,
+        )
+
+        log_event(
+            "INFO",
+            "Verify",
+            f"SHA-256 OK | {expected_hash[:12]}...",
+        )
+
+        extract_ffmpeg_binary(archive, target)
+
+        if not target.is_file() or target.stat().st_size <= 0:
+            raise RuntimeError(
+                f"FFmpeg 解压后不存在或为空: {target}"
+            )
+
+        log_event(
+            "INFO",
+            "FFmpeg",
+            f"installed: {target}",
+        )
+        return str(target)
+
+    except PermissionError as exc:
+        raise RuntimeError(
+            "脚本目录不可写，无法自动安装 FFmpeg: "
+            f"{script_directory()}\n"
+            "请调整目录权限，或使用 --ffmpeg 手动指定。"
+        ) from exc
+
+    finally:
+        try:
+            archive.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def find_ffmpeg(explicit: str | None = None) -> str:
     """
-    Resolve the FFmpeg binary cross-platform.
+    Resolve FFmpeg with deterministic precedence:
 
-    --ffmpeg may be:
-      * an absolute/relative filesystem path
-      * a command name available in PATH
+      1. explicit --ffmpeg
+      2. ffmpeg from PATH
+      3. previously auto-downloaded ffmpeg beside this script
+      4. download latest matching BtbN static GPL build beside this script
+
+    An invalid explicit --ffmpeg is treated as a user error and does not
+    silently fall through to auto-download.
     """
     if explicit:
         candidate = Path(explicit).expanduser()
 
-        # Treat anything containing a directory component as an explicit path.
         if candidate.parent != Path("."):
             candidate = candidate.resolve()
 
@@ -485,10 +794,8 @@ def find_ffmpeg(explicit: str | None = None) -> str:
                     f"指定的 FFmpeg 没有可执行权限: {candidate}\n"
                     f"可执行: chmod +x {candidate}"
                 )
-
             return str(candidate)
 
-        # Bare command name: search PATH.
         found = shutil.which(explicit)
         if found:
             return found
@@ -498,18 +805,25 @@ def find_ffmpeg(explicit: str | None = None) -> str:
             "请传入完整路径，或确保该命令已加入 PATH。"
         )
 
-    if os.name == "nt":
-        ffmpeg = shutil.which("ffmpeg.exe") or shutil.which("ffmpeg")
-    else:
-        ffmpeg = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+    names = ("ffmpeg.exe", "ffmpeg") if os.name == "nt" else ("ffmpeg",)
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            return found
 
-    if not ffmpeg:
-        raise RuntimeError(
-            "找不到 FFmpeg。请将 ffmpeg 加入 PATH，"
-            "或使用 --ffmpeg 指定二进制路径。"
-        )
+    local = local_ffmpeg_path()
+    if local.is_file():
+        if platform.system() != "Windows" and not os.access(local, os.X_OK):
+            try:
+                local.chmod(local.stat().st_mode | 0o111)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"脚本目录中的 FFmpeg 不可执行: {local}"
+                ) from exc
+        return str(local)
 
-    return ffmpeg
+    return auto_download_ffmpeg()
+
 
 
 def run_capture(cmd: list[str]) -> subprocess.CompletedProcess[str]:
@@ -1102,12 +1416,155 @@ def resolve_output_root(input_path: Path, output_arg: str | None) -> Path | None
     return None
 
 
+def parse_nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value, 10)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("必须是非负整数") from exc
+
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("必须是非负整数")
+    return parsed
+
+
+def parse_output_mode(value: str) -> int:
+    """Parse chmod-style octal modes such as 775, 0775 or 0o775."""
+    raw = value.strip().lower()
+    if raw.startswith("0o"):
+        raw = raw[2:]
+
+    if not raw or not re.fullmatch(r"[0-7]{1,4}", raw):
+        raise argparse.ArgumentTypeError(
+            "权限必须是八进制，例如 775、0775、0750 或 0o775"
+        )
+
+    mode = int(raw, 8)
+    if not 0 <= mode <= 0o7777:
+        raise argparse.ArgumentTypeError("权限范围必须是 0000..7777")
+    return mode
+
+
+@dataclass(frozen=True)
+class OutputDirPolicy:
+    """Linux ownership/mode policy for directories created by this script."""
+
+    uid: int | None = None
+    gid: int | None = None
+    mode: int | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.uid is not None or self.gid is not None or self.mode is not None
+
+    def describe(self) -> str:
+        uid = str(self.uid) if self.uid is not None else "inherit"
+        gid = str(self.gid) if self.gid is not None else "inherit"
+        mode = f"{self.mode:04o}" if self.mode is not None else "umask"
+        return f"uid={uid} gid={gid} mode={mode} | new directories only"
+
+
+def apply_output_directory_policy(
+    directory: Path,
+    policy: OutputDirPolicy,
+) -> None:
+    """Apply ownership first, then exact mode, to one newly created directory."""
+    if not policy.enabled:
+        return
+
+    if platform.system() != "Linux":
+        raise RuntimeError(
+            "output uid/gid/mode policy is supported only on Linux"
+        )
+
+    try:
+        if policy.uid is not None or policy.gid is not None:
+            os.chown(
+                directory,
+                policy.uid if policy.uid is not None else -1,
+                policy.gid if policy.gid is not None else -1,
+            )
+
+        if policy.mode is not None:
+            os.chmod(directory, policy.mode)
+
+    except PermissionError as exc:
+        raise RuntimeError(
+            f"无法设置新 output 目录的属主/权限: {directory}\n"
+            f"requested: {policy.describe()}\n"
+            "设置其它 UID/GID 通常需要 root 权限。"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"设置新 output 目录属主/权限失败: {directory}\n"
+            f"requested: {policy.describe()}\n{exc}"
+        ) from exc
+
+
+def ensure_output_directory(
+    directory: Path,
+    policy: OutputDirPolicy,
+) -> list[Path]:
+    """
+    Create an output directory tree and apply policy only to directories that
+    were missing before this call.
+
+    Existing directories are intentionally left untouched. A lock makes this
+    deterministic with multiple transcoding workers creating sibling paths.
+    """
+    directory = directory.resolve()
+
+    with _OUTPUT_DIR_LOCK:
+        if directory.exists():
+            if not directory.is_dir():
+                raise RuntimeError(f"output 路径不是目录: {directory}")
+            return []
+
+        missing: list[Path] = []
+        current = directory
+
+        while not current.exists():
+            missing.append(current)
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+
+        directory.mkdir(parents=True, exist_ok=True)
+
+        # Apply deepest-first. This avoids making a parent non-traversable
+        # before policy has been applied to its newly created children.
+        for created in missing:
+            if not created.is_dir():
+                raise RuntimeError(
+                    f"创建 output 目录后路径状态异常: {created}"
+                )
+            apply_output_directory_policy(created, policy)
+
+        return missing
+
+
+def apply_output_file_mode(path: Path, mode: int | None) -> None:
+    """Apply an exact chmod mode to one output file on Linux."""
+    if mode is None:
+        return
+    if platform.system() != "Linux":
+        raise RuntimeError("--output-file-mode is supported only on Linux")
+    try:
+        os.chmod(path, mode)
+    except OSError as exc:
+        raise RuntimeError(
+            f"设置 output 文件权限失败: {path}\n"
+            f"requested mode: {mode:04o}\n{exc}"
+        ) from exc
+
+
 def output_for_file(
     src: Path,
     input_path: Path,
     output_arg: str | None,
     output_root: Path | None,
     recursive: bool,
+    output_policy: OutputDirPolicy,
 ) -> Path:
     if input_path.is_file():
         if output_arg:
@@ -1115,12 +1572,12 @@ def output_for_file(
             if out.exists() and out.is_dir():
                 return (out / f"{src.stem}.nvenc.mp4").resolve()
             if str(output_arg).endswith(("/", "\\")):
-                out.mkdir(parents=True, exist_ok=True)
+                ensure_output_directory(out, output_policy)
                 return (out / f"{src.stem}.nvenc.mp4").resolve()
             if out.suffix.lower() == ".mp4":
                 return out.resolve()
             if not out.suffix:
-                out.mkdir(parents=True, exist_ok=True)
+                ensure_output_directory(out, output_policy)
                 return (out / f"{src.stem}.nvenc.mp4").resolve()
             raise RuntimeError("单文件模式下 -o 指定文件名时必须为 .mp4")
         return src.with_name(f"{src.stem}.nvenc.mp4")
@@ -1164,6 +1621,8 @@ def copy_sibling_non_video_files(
     watch_root: Path,
     output_root: Path,
     keep_sub_path: bool,
+    output_policy: OutputDirPolicy,
+    output_file_mode: int | None,
 ) -> int:
     """
     Copy all non-video regular files in the source video's directory.
@@ -1177,7 +1636,7 @@ def copy_sibling_non_video_files(
     else:
         dest_dir = output_root
 
-    dest_dir.mkdir(parents=True, exist_ok=True)
+    ensure_output_directory(dest_dir, output_policy)
     copied = 0
 
     for item in src.parent.iterdir():
@@ -1196,6 +1655,7 @@ def copy_sibling_non_video_files(
             pass
 
         shutil.copy2(item, dst)
+        apply_output_file_mode(dst, output_file_mode)
         copied += 1
 
     return copied
@@ -2010,6 +2470,7 @@ def build_ffmpeg_command(
         "-map", "0:a?",
 
         "-vf", video_filter,
+        "-noautoscale",
         "-c:v", encoder,
         "-gpu", str(gpu),
         "-preset", preset,
@@ -2022,7 +2483,7 @@ def build_ffmpeg_command(
         cmd += ["-rc", "vbr", "-b:v", bitrate]
 
     cmd += [
-        "-fps_mode:v", "passthrough",
+        "-fps_mode:v", "vfr",
         "-c:a", "copy",
         "-map_metadata", "0",
         "-map_chapters", "0",
@@ -2274,8 +2735,9 @@ def make_temp_output_path(
 def commit_temp_output(
     temp_dst: Path,
     dst: Path,
+    output_policy: OutputDirPolicy,
 ) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
+    ensure_output_directory(dst.parent, output_policy)
 
     try:
         temp_dst.replace(dst)
@@ -2320,6 +2782,8 @@ def transcode_one(
     crop_decoder: str | None,
     overwrite: bool,
     temp_dir: Path | None = None,
+    output_policy: OutputDirPolicy = OutputDirPolicy(),
+    output_file_mode: int | None = None,
     progress_reporter: ProgressReporter | None = None,
     job_index: int = 1,
     worker_slot: int = 1,
@@ -2337,7 +2801,7 @@ def transcode_one(
     # commit_temp_output() after FFmpeg succeeds. This prevents interrupted
     # watch jobs from leaving empty output/sub/... directories behind.
     if temp_dir is None:
-        dst.parent.mkdir(parents=True, exist_ok=True)
+        ensure_output_directory(dst.parent, output_policy)
 
     if dst.exists() and not overwrite:
         return "skipped"
@@ -2445,7 +2909,8 @@ def transcode_one(
             f"FFmpeg 日志:\n{log}"
         )
 
-    commit_temp_output(temp_dst, dst)
+    commit_temp_output(temp_dst, dst, output_policy)
+    apply_output_file_mode(dst, output_file_mode)
 
     if progress_reporter is not None:
         progress_reporter.finish(
@@ -2474,6 +2939,8 @@ class TranscodeConfig:
     pad_y: str
     temp_root: Path | None
     input_path: Path
+    output_policy: OutputDirPolicy
+    output_file_mode: int | None
 
     @property
     def watch_mode(self) -> bool:
@@ -2516,6 +2983,8 @@ class TranscodeConfig:
             crop_decoder=crop_decoder,
             overwrite=self.args.overwrite,
             temp_dir=self.temp_root,
+            output_policy=self.output_policy,
+            output_file_mode=self.output_file_mode,
             progress_reporter=reporter,
             job_index=index,
             worker_slot=worker_slot,
@@ -2557,7 +3026,8 @@ def build_parser() -> argparse.ArgumentParser:
             "禁用 FFmpeg 自动 rotation metadata；旋转仅由 --rotate 显式执行。\n"
             "SIGINT/SIGTERM/SIGHUP/SIGQUIT 会触发完整清理；检测到 Unraid "
             "User Scripts 时，nv_transcode 自身会绑定父 shell 的死亡 SIGTERM；"
-            "Linux 下 FFmpeg 也有父进程死亡保护。\n"
+            "Linux 下 FFmpeg 也有父进程死亡保护；可为脚本新建的 output "
+            "目录指定 UID/GID/mode，并单独指定 output 文件 mode。\n"
             "视频硬件链路不可用时直接失败，不做 CPU decode/scale fallback。"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
@@ -2588,7 +3058,9 @@ def build_parser() -> argparse.ArgumentParser:
             "FFmpeg 二进制路径或命令名。\n"
             "Windows: --ffmpeg D:\\ffmpeg\\bin\\ffmpeg.exe\n"
             "Linux:   --ffmpeg /usr/local/bin/ffmpeg\n"
-            "省略时自动从 PATH 查找 ffmpeg。"
+            "省略时依次查找 PATH、脚本目录；仍未找到则从 BtbN/FFmpeg-Builds "
+            "latest release 自动下载匹配系统/架构的 static GPL build 到脚本目录，"
+            "并执行 SHA-256 校验。"
         ),
     )
     parser.add_argument(
@@ -2610,6 +3082,47 @@ def build_parser() -> argparse.ArgumentParser:
             "指定后，最终 output 子目录延迟到转码成功提交时才创建。\n"
             "跨文件系统提交时会先在目标目录写隐藏 .staging 文件，再原子替换最终文件。\n"
             "例如 Unraid: --temp-dir /mnt/cache/transcode-temp"
+        ),
+    )
+
+    linux_output = parser.add_argument_group("Linux output 目录")
+    linux_output.add_argument(
+        "--output-uid",
+        type=parse_nonnegative_int,
+        default=None,
+        help=(
+            "仅 Linux：脚本新创建的 output 目录设置为该 UID。"
+            "默认不修改属主；已有目录永不修改。"
+        ),
+    )
+    linux_output.add_argument(
+        "--output-gid",
+        type=parse_nonnegative_int,
+        default=None,
+        help=(
+            "仅 Linux：脚本新创建的 output 目录设置为该 GID。"
+            "默认不修改属组；已有目录永不修改。"
+        ),
+    )
+    linux_output.add_argument(
+        "--output-mode",
+        type=parse_output_mode,
+        default=None,
+        metavar="MODE",
+        help=(
+            "仅 Linux：脚本新创建的 output 目录权限，例如 775、0775、0750。"
+            "按精确 chmod mode 应用，不受 umask 影响；已有目录永不修改。"
+        ),
+    )
+    linux_output.add_argument(
+        "--output-file-mode",
+        type=parse_output_mode,
+        default=None,
+        metavar="MODE",
+        help=(
+            "仅 Linux：output 文件权限，例如 664、0664、0644。"
+            "作用于最终转码文件和 --copy-other-files 复制的文件；"
+            "按精确 chmod mode 应用，不受源文件权限或 umask 影响。"
         ),
     )
 
@@ -2849,6 +3362,21 @@ def parse_config(
     except argparse.ArgumentTypeError as exc:
         parser.error(str(exc))
 
+    output_policy = OutputDirPolicy(
+        uid=args.output_uid,
+        gid=args.output_gid,
+        mode=args.output_mode,
+    )
+
+    if (
+        output_policy.enabled
+        or args.output_file_mode is not None
+    ) and platform.system() != "Linux":
+        parser.error(
+            "--output-uid / --output-gid / --output-mode / "
+            "--output-file-mode 仅支持 Linux"
+        )
+
     if pad is None:
         orphan_pad = [
             name for name in ("--pad-x", "--pad-y", "--pad-color")
@@ -2889,6 +3417,8 @@ def parse_config(
         pad_y=pad_y,
         temp_root=temp_root,
         input_path=input_path,
+        output_policy=output_policy,
+        output_file_mode=args.output_file_mode,
     )
 
 
@@ -2924,6 +3454,8 @@ def resolve_runtime(config: TranscodeConfig) -> TranscodeConfig:
         pad_y=config.pad_y,
         temp_root=config.temp_root,
         input_path=config.input_path,
+        output_policy=config.output_policy,
+        output_file_mode=config.output_file_mode,
     )
 
 
@@ -2975,6 +3507,18 @@ def log_common_config(
     log_event("INFO", "Quality", config.quality_text)
     log_event("INFO", "MaxRes", args.resolution)
     log_event("INFO", "Workers", str(args.workers))
+    if config.output_policy.enabled:
+        log_event(
+            "INFO",
+            "Output dirs",
+            config.output_policy.describe(),
+        )
+    if config.output_file_mode is not None:
+        log_event(
+            "INFO",
+            "Output files",
+            f"mode={config.output_file_mode:04o}",
+        )
 
 
 def validate_unique_destinations(
@@ -3070,6 +3614,7 @@ def run_batch_mode(config: TranscodeConfig) -> int:
             args.output,
             output_root,
             args.recursive,
+            config.output_policy,
         )
         if src.resolve() == dst.resolve():
             raise RuntimeError(
@@ -3215,7 +3760,7 @@ def prepare_watch_paths(
     if output_root.exists() and not output_root.is_dir():
         raise RuntimeError(f"--output 必须是目录: {output_root}")
 
-    output_root.mkdir(parents=True, exist_ok=True)
+    ensure_output_directory(output_root, config.output_policy)
 
     if config.temp_root == watch_root:
         raise RuntimeError("--temp-dir 不能与 --watch 指向同一个目录")
@@ -3291,6 +3836,8 @@ def handle_watch_success(
             watch_root=watch_root,
             output_root=output_root,
             keep_sub_path=bool(args.keep_sub_path),
+            output_policy=config.output_policy,
+            output_file_mode=config.output_file_mode,
         )
         log_event(
             "INFO",
