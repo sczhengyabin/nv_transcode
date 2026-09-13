@@ -2641,6 +2641,23 @@ def terminate_all_ffmpeg() -> None:
         if process.poll() is None:
             terminate_process_tree(process, force=True)
 
+    # A worker that had already passed its pre-spawn stop check can register a
+    # process after the snapshot above, or self-kill slightly late. Re-sweep so
+    # no tracked FFmpeg child can outlive this function.
+    for _ in range(3):
+        with _PROCESS_LOCK:
+            stragglers = [
+                proc for proc in _ACTIVE_PROCESSES if proc.poll() is None
+            ]
+
+        if not stragglers:
+            break
+
+        for process in stragglers:
+            terminate_process_tree(process, force=True)
+
+        time.sleep(0.1)
+
 
 def shutdown_executor_after_abort(
     executor: ThreadPoolExecutor,
@@ -4259,6 +4276,10 @@ def main() -> int:
 
     save_terminal_state()
     atexit.register(restore_terminal_state)
+    # Last safety net: covers exits that bypass main()'s cleanup clauses
+    # (SystemExit, unexpected BaseException). Not reached by os._exit(), which
+    # is only used after the cleanup below has already terminated everything.
+    atexit.register(terminate_all_ffmpeg)
 
     parser = build_parser()
     config = parse_config(parser)
@@ -4278,15 +4299,17 @@ def main() -> int:
 
     except KeyboardInterrupt as exc:
         exit_code = graceful_exit_code(exc)
-        terminate_all_ffmpeg()
-        restore_terminal_state()
         return exit_code
 
     except Exception as exc:
         log_event("FAIL", "Fatal", str(exc), error=True)
+        return 1
+
+    finally:
+        # Every exit path, including SystemExit and unexpected BaseException,
+        # must leave no FFmpeg child process behind.
         terminate_all_ffmpeg()
         restore_terminal_state()
-        return 1
 
 
 def finalize_process_exit(exit_code: int) -> None:
