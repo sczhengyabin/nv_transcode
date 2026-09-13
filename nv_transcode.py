@@ -36,6 +36,7 @@ import urllib.error
 import urllib.request
 import uuid
 import zipfile
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2082,6 +2083,8 @@ class _ProgressJob:
 class ProgressReporter:
     """NBMiner-style periodic status table for concurrent workers."""
 
+    _MIN_WINDOW = 1.0
+
     def __init__(
         self,
         total: int,
@@ -2103,6 +2106,7 @@ class ProgressReporter:
 
         self.active: dict[int, _ProgressJob] = {}
         self.latest: dict[int, dict[str, str]] = {}
+        self.history: dict[int, deque[tuple[float, float, int | None]]] = {}
 
     def set_total(self, total: int) -> None:
         with self.lock:
@@ -2131,6 +2135,7 @@ class ProgressReporter:
         with self.lock:
             self.active[slot] = job
             self.latest.pop(slot, None)
+            self.history[slot] = deque([(job.started, 0.0, 0)])
 
         duration_text = (
             format_duration(duration)
@@ -2166,11 +2171,12 @@ class ProgressReporter:
         return 0.0
 
     @staticmethod
-    def _parse_speed(state: dict[str, str]) -> float | None:
-        raw = state.get("speed", "").strip().lower().removesuffix("x")
+    def _state_frames(state: dict[str, str]) -> int | None:
+        raw = state.get("frame", "").strip()
+        if not raw:
+            return None
         try:
-            value = float(raw)
-            return value if value >= 0 else None
+            return int(raw)
         except ValueError:
             return None
 
@@ -2216,6 +2222,38 @@ class ProgressReporter:
         except Exception:
             return 120
 
+    def _interval_window(
+        self,
+        slot: int,
+    ) -> tuple[float, float, int | None] | None:
+        """Wallclock seconds, encoded seconds and frames of one display window."""
+        history = self.history.get(slot)
+        if not history:
+            return None
+
+        end_time, end_seconds, end_frames = history[-1]
+        target = end_time - max(self.interval, self._MIN_WINDOW)
+        start_time, start_seconds, start_frames = history[0]
+        for sample in reversed(history):
+            if sample[0] <= target:
+                start_time, start_seconds, start_frames = sample
+                break
+
+        elapsed = end_time - start_time
+        if elapsed < self._MIN_WINDOW:
+            return None
+
+        gained = end_seconds - start_seconds
+        if end_frames is not None and start_frames is not None:
+            frames = end_frames - start_frames
+        else:
+            frames = None
+
+        if gained < 0 or (frames is not None and frames < 0):
+            return None
+
+        return elapsed, gained, frames
+
     def _row(
         self,
         slot: int,
@@ -2223,7 +2261,9 @@ class ProgressReporter:
         state: dict[str, str],
         now: float,
         file_width: int,
-    ) -> tuple[str, float | None]:
+        fps: float | None,
+        speed: float | None,
+    ) -> str:
         out_seconds = self._state_seconds(state)
         elapsed = max(0.0, now - job.started)
 
@@ -2238,27 +2278,27 @@ class ProgressReporter:
             job.duration,
             job.source_size,
         )
-        speed_value = self._parse_speed(state)
 
         progress_text = f"{percent:6.1f}%" if percent is not None else "    ?.?%"
         ratio_text = f"{ratio * 100:6.1f}%" if ratio is not None else "     --"
+        fps_text = f"{fps:.1f}" if fps is not None else "--"
+        speed_text = f"{speed:.2f}x" if speed is not None else "--"
         video_text = (
             f"{format_duration(out_seconds)}/"
             f"{format_duration(job.duration)}"
         )
 
-        row = (
+        return (
             f"{slot:>2} "
             f"{f'{job.index}/{self.total}':>7} "
             f"{progress_text:>7} "
             f"{video_text:>17} "
             f"{format_duration(elapsed):>8} "
-            f"{state.get('fps', '?'):>6} "
-            f"{state.get('speed', '?'):>7} "
+            f"{fps_text:>6} "
+            f"{speed_text:>7} "
             f"{ratio_text:>7} "
             f"{self._truncate(job.src.name, file_width)}"
         )
-        return row, speed_value
 
     def _build_table(
         self,
@@ -2282,14 +2322,20 @@ class ProgressReporter:
         speeds: list[float] = []
 
         for slot in active_slots:
-            row, speed = self._row(
-                slot,
-                self.active[slot],
-                self.latest[slot],
-                now,
-                file_width,
+            job = self.active[slot]
+            state = self.latest[slot]
+            window = self._interval_window(slot)
+
+            fps = None
+            speed = None
+            if window is not None:
+                elapsed, gained, frames = window
+                fps = frames / elapsed if frames is not None else None
+                speed = gained / elapsed
+
+            rows.append(
+                self._row(slot, job, state, now, file_width, fps, speed)
             )
-            rows.append(row)
             if speed is not None:
                 speeds.append(speed)
 
@@ -2328,6 +2374,13 @@ class ProgressReporter:
                 return
 
             self.latest[slot] = dict(state)
+            history = self.history.setdefault(slot, deque())
+            history.append(
+                (now, self._state_seconds(state), self._state_frames(state))
+            )
+            horizon = now - (max(self.interval, self._MIN_WINDOW) + 2.0)
+            while len(history) > 2 and history[0][0] < horizon:
+                history.popleft()
 
             if not force and now - self.last_snapshot < self.interval:
                 return
@@ -2352,6 +2405,7 @@ class ProgressReporter:
             if job is not None and job.index == index:
                 self.active.pop(slot, None)
                 self.latest.pop(slot, None)
+                self.history.pop(slot, None)
             else:
                 job = None
 
