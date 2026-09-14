@@ -2478,6 +2478,7 @@ def build_ffmpeg_command(
     bitrate: str | None,
     crop: str | None,
     crop_decoder: str | None,
+    decode_threads: int = 1,
 ) -> list[str]:
     cmd = [
         ffmpeg,
@@ -2513,6 +2514,16 @@ def build_ffmpeg_command(
             "-hwaccel_device", "gpu",
             "-hwaccel_output_format", "cuda",
         ]
+
+    if decode_threads > 0:
+        # The NVDEC decode surface pool is roughly stream DPB + decoder threads
+        # and cuvidCreateDecoder() rejects more than 32 with
+        # CUDA_ERROR_INVALID_VALUE, which silently falls back to software decode
+        # and then fails on the CUDA filter graph. FFmpeg before 9.0 passes the
+        # requested pool through uncapped, so keeping FFmpeg's default (auto,
+        # often 16) wastes most of that budget. Decode itself runs on the GPU,
+        # so a low thread count costs no throughput.
+        cmd += ["-threads", str(decode_threads)]
 
     cmd += [
         # FFmpeg enables input autorotation by default. Disable it so rotation
@@ -2852,6 +2863,7 @@ def transcode_one(
     crop: str | None,
     crop_decoder: str | None,
     overwrite: bool,
+    decode_threads: int = 1,
     temp_dir: Path | None = None,
     output_policy: OutputDirPolicy = OutputDirPolicy(),
     output_file_mode: int | None = None,
@@ -2947,6 +2959,7 @@ def transcode_one(
         bitrate,
         crop,
         crop_decoder,
+        decode_threads=decode_threads,
     )
 
     def on_progress(state: dict[str, str]) -> None:
@@ -3053,6 +3066,7 @@ class TranscodeConfig:
             crop=self.crop,
             crop_decoder=crop_decoder,
             overwrite=self.args.overwrite,
+            decode_threads=self.args.decode_threads,
             temp_dir=self.temp_root,
             output_policy=self.output_policy,
             output_file_mode=self.output_file_mode,
@@ -3349,6 +3363,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="并发 FFmpeg 任务数，默认 1；例如 --workers 3",
     )
     video.add_argument(
+        "--decode-threads",
+        type=parse_nonnegative_int,
+        default=1,
+        help=(
+            "解码线程数，默认 1。NVDEC 会按线程数分配解码 surface，"
+            "线程过多会超过 32 个上限导致 GPU 解码初始化失败并回退 CPU；"
+            "0 表示交给 FFmpeg 自动决定（不推荐）。"
+        ),
+    )
+    video.add_argument(
         "--progress-interval",
         type=float,
         default=2.0,
@@ -3578,6 +3602,7 @@ def log_common_config(
     log_event("INFO", "Quality", config.quality_text)
     log_event("INFO", "MaxRes", args.resolution)
     log_event("INFO", "Workers", str(args.workers))
+    log_event("INFO", "DecodeThr", str(args.decode_threads))
     if config.output_policy.enabled:
         log_event(
             "INFO",
